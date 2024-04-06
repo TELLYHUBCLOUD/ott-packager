@@ -216,7 +216,7 @@ void *audio_encode_thread(void *context)
                 encoded_output_buffer = (uint8_t*)memory_take(core->compressed_audio_pool, output_size);
                 if (!encoded_output_buffer) {
                     send_direct_error(core, SIGNAL_DIRECT_ERROR_NALPOOL, "Out of Compressed Audio Buffers (AAC) - Restarting Service");
-                    exit(0);
+                    _Exit(0);
                 }
                 memcpy(encoded_output_buffer, output_buffer, output_size);
 
@@ -325,7 +325,7 @@ void *audio_monitor_thread(void *context)
                         if (!output_audio_frame) {
                             fprintf(stderr,"FATAL ERROR: unable to obtain output_audio_frame!!\n");
                             send_direct_error(core, SIGNAL_DIRECT_ERROR_RAWPOOL, "Out of Uncompressed Audio Buffers (MONITOR) - Restarting Service");
-                            exit(0);
+                            _Exit(0);
                         }
 
                         encode_msg = (dataqueue_message_struct*)memory_take(core->fillet_msg_pool, sizeof(dataqueue_message_struct));
@@ -337,10 +337,10 @@ void *audio_monitor_thread(void *context)
                             encode_msg->pts = (int64_t)((double)monitor_anchor_pts+((double)total_dead_frames*(double)frame_delta)); // rolls over?
                             encode_msg->dts = (int64_t)((double)monitor_anchor_dts+((double)total_dead_frames*(double)frame_delta));
 
-                            if (encode_msg->pts > MAX_PTS) {
+                            while (encode_msg->pts > MAX_PTS) {
                                 encode_msg->pts = encode_msg->pts - MAX_PTS;
                             }
-                            if (encode_msg->dts > MAX_DTS) {
+                            while (encode_msg->dts > MAX_DTS) {
                                 encode_msg->dts = encode_msg->dts - MAX_DTS;
                             }
 
@@ -364,7 +364,7 @@ void *audio_monitor_thread(void *context)
                         } else {
                             fprintf(stderr,"FATAL ERROR: unable to obtain audio encode_msg!!\n");
                             send_direct_error(core, SIGNAL_DIRECT_ERROR_MSGPOOL, "Out of Message Audio Buffers (MONITOR) - Restarting Service");
-                            exit(0);
+                            _Exit(0);
                         }
                     }
                 }
@@ -448,6 +448,10 @@ void *audio_decode_thread(void *context)
     int src_nb_channels = 0;
     int previous_updated_output_buffer_size = 0;
     int audio_decode_fail = 0;
+#define AUDIO_WORKING_BUFFER_SIZE 1024*1024
+    uint8_t *inbuf = (uint8_t*)malloc(AUDIO_WORKING_BUFFER_SIZE);
+    uint8_t *data = NULL;
+    int data_size = 0;
 
     free(startup);
     startup = NULL;
@@ -499,6 +503,7 @@ restart_decode:
                     swr_output_buffer = NULL;
                     decode_parser = NULL;
                     swr = NULL;
+                    data_size = 0;
 
                     audio_decoder_ready = 0;
                 }
@@ -516,7 +521,7 @@ restart_decode:
                         //unknown media type- report error and quit!
                         fprintf(stderr,"error: unknown media type - unable to process sample\n");
                         send_direct_error(core, SIGNAL_DIRECT_ERROR_UNKNOWN, "Unknown Audio Format - Restarting Service");
-                        exit(0);
+                        _Exit(0);
                     }
                     decode_parser = av_parser_init(decode_codec->id);
                     decode_avctx = avcodec_alloc_context3(decode_codec);
@@ -547,19 +552,31 @@ restart_decode:
                     first_sync_sample = 0;
                 }
 
+                if (data_size > 0) {
+                    memmove(inbuf, data, data_size);
+                    data = inbuf;
+                    memcpy(data + data_size, incoming_audio_buffer, incoming_audio_buffer_size);
+                    data_size += incoming_audio_buffer_size;
+                } else {
+                    memcpy(inbuf, incoming_audio_buffer, incoming_audio_buffer_size);
+                    data = inbuf;
+                    data_size = incoming_audio_buffer_size;
+                }
+
                 core->decoded_source_info.decoded_audio_media_type[audio_stream] = frame->media_type;
 
-                //sometimes the audio frames are concatenated, especially coming from
-                //an mpeg2 transport stream
-                decode_pkt->size = 0;
+                // sometimes the audio frames are concatenated, especially coming from
+                // an mpeg2 transport stream
+
+                //decode_pkt->size = 0;
                 fprintf(stderr,"audio_decode_thread: starting audio decode of sample\n");
-                while (incoming_audio_buffer_size > 0) {
+                while (data_size > 0) {
                     retcode = av_parser_parse2(decode_parser,
                                                decode_avctx,
                                                &decode_pkt->data,
                                                &decode_pkt->size,
-                                               incoming_audio_buffer,
-                                               incoming_audio_buffer_size,
+                                               data,
+                                               data_size,
                                                AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
 
                     fprintf(stderr,"audio_decode_thread: decode_pkt->size=%d  incoming_audio_buffer_size=%d incoming_pts=%ld retcode=%d\n",
@@ -580,29 +597,23 @@ restart_decode:
                         break;
                     }
 
-                    incoming_audio_buffer_size -= retcode;
-                    incoming_audio_buffer += retcode;
+                    data_size -= retcode;
+                    data += retcode;
 
                     if (decode_pkt->size == 0) {
                         break;
                     }
+
                     decode_pkt->pts = frame->pts;
                     decode_pkt->dts = frame->full_time;
 
                     retcode = avcodec_send_packet(decode_avctx, decode_pkt);
-                    //uint8_t *startdata;
-                    //startdata = (uint8_t*)decode_pkt->data;
-
-                    /*fprintf(stderr,"audio startdata: 0x%x 0x%x 0x%x 0x%x\n",
-                            *(startdata+0),
-                            *(startdata+1),
-                            *(startdata+2),
-                            *(startdata+3));
-                            */
 
                     if (retcode < 0) {
+                        char errormsg[MAX_MESSAGE_SIZE];
                         fprintf(stderr,"error: unable to decode audio frame - sorry - buffersize:%d, retcode=%d\n", decode_pkt->size, retcode);
-                        send_signal(core, SIGNAL_DECODE_ERROR, "Audio Decode Error");
+                        snprintf(errormsg, MAX_MESSAGE_SIZE-1, "Audio Decode Error, pts=%ld, size=%d, retcode=%d", frame->full_time, decode_pkt->size, retcode);
+                        send_signal(core, SIGNAL_DECODE_ERROR, errormsg);
                         audio_decode_fail++;
                         break;
                     }
@@ -680,6 +691,7 @@ restart_decode:
                                full_time,
                                first_decoded_pts);
                         if (full_time < first_decoded_pts) {
+                            char errormsg[MAX_MESSAGE_SIZE];
                             if (frame) {
                                 memory_return(core->compressed_audio_pool, frame->buffer);
                                 frame->buffer = NULL;
@@ -689,15 +701,17 @@ restart_decode:
                             memory_return(core->fillet_msg_pool, msg);
                             msg = NULL;
 
-                            // seeing this sometimes?
-                            // audio_decode_thread: current source audio=-9223372036854775808 is less than first audio frame=1318257419, waiting to decode...
-
                             fprintf(stderr,"\n\n\n\naudio_decode_thread: current source audio=%ld is less than first audio frame=%ld, waiting to decode...dropping sample\n\n\n\n\n",
                                     full_time,
                                     first_decoded_pts);
                             syslog(LOG_INFO,"audio_decode_thread: current source audio=%ld is less than first audio frame=%ld, waiting to decode...dropping sample\n",
                                    full_time,
                                    first_decoded_pts);
+
+                            snprintf(errormsg, MAX_MESSAGE_SIZE-1, "Current Source Audio=%ld is Less Than First Audio=%ld, Dropping Sample",
+                                     full_time,
+                                     first_decoded_pts);
+                            send_signal(core, SIGNAL_MALFORMED_DATA, errormsg);
                             goto restart_decode;
                         }
 
@@ -824,12 +838,14 @@ restart_decode:
                                 int quit_threshold = 65535*output_channels*2;
                                 if (diff_audio > quit_threshold ||
                                     diff_audio < (-2*quit_threshold)) {
+                                    char errormsg[MAX_MESSAGE_SIZE];
                                     fprintf(stderr,"audio_decode_thread: fatal error: a/v sync is off - too much or too little audio is present - %ld samples\n", diff_audio);
                                     syslog(LOG_ERR,"audio_decode_thread: fatal error: a/v sync is off - too much or too little audio is present - %ld samples\n", diff_audio);
                                     threshold_check++;
                                     if (threshold_check >= AUDIO_THRESHOLD_CHECK) {
-                                        send_direct_error(core, SIGNAL_DIRECT_ERROR_AVSYNC, "A/V Sync Is Compromised (AUDIO) - Restarting Service");
-                                        exit(0);
+                                        snprintf(errormsg, MAX_MESSAGE_SIZE-1, "A/V Sync Is Compromised (AUDIO), Restarting Service, diff_audio=%ld, output_channels=%d, full_time=%ld", diff_audio, output_channels, full_time);
+                                        send_direct_error(core, SIGNAL_DIRECT_ERROR_AVSYNC, errormsg);
+                                        _Exit(0);
                                     }
                                 }
                             } else {
@@ -855,7 +871,7 @@ restart_decode:
                             fprintf(stderr,"audio_decode_thread: fatal error: unable to obtain decoded_audio_buffer from pool!\n");
                             syslog(LOG_ERR,"audio_decode_thread: fatal error: unable to obtain decoded_audio_buffer from pool!\n");
                             send_direct_error(core, SIGNAL_DIRECT_ERROR_RAWPOOL, "Out of Uncompressed Audio Buffers - Restarting Service");
-                            exit(0);
+                            _Exit(0);
                         }
                         // check size
                         memcpy(decoded_audio_buffer, swr_output_buffer[0], updated_output_buffer_size);
@@ -897,7 +913,7 @@ restart_decode:
                                 fprintf(stderr,"fatal error: unable to obtain filler_decoded_audio_buffer from pool!\n");
                                 syslog(LOG_ERR,"fatal error: unable to obtain filler_decoded_audio_buffer from pool!\n");
                                 send_direct_error(core, SIGNAL_DIRECT_ERROR_RAWPOOL, "Out of Uncompressed Audio Buffers (RAW) - Restarting Service");
-                                exit(0);
+                                _Exit(0);
                             }
                             memset(filler_decoded_audio_buffer, 0, updated_output_buffer_size);
                             encode_msg = (dataqueue_message_struct*)memory_take(core->fillet_msg_pool, sizeof(dataqueue_message_struct));
@@ -916,7 +932,7 @@ restart_decode:
                                 dataqueue_put_front(core->monitoraudio[audio_stream]->input_queue, encode_msg);
                             } else {
                                 send_direct_error(core, SIGNAL_DIRECT_ERROR_MSGPOOL, "Out of Message Buffers (RAW) - Restarting Service");
-                                exit(0);
+                                _Exit(0);
                             }
                             current_sample_out++;
                             pthread_mutex_lock(core->audio_mutex[audio_stream]);
@@ -964,7 +980,7 @@ restart_decode:
                                 dataqueue_put_front(core->monitoraudio[audio_stream]->input_queue, encode_msg);
                             } else {
                                 send_direct_error(core, SIGNAL_DIRECT_ERROR_MSGPOOL, "Out of Message Buffers - Restarting Service");
-                                exit(0);
+                                _Exit(0);
                             }
                             current_sample_out++;
                         }
@@ -983,7 +999,7 @@ restart_decode:
             }
         } else {
             send_direct_error(core, SIGNAL_DIRECT_ERROR_MSGPOOL, "Out of Message Buffers - Restarting Service");
-            exit(0);
+            _Exit(0);
         }
     }
 
@@ -996,6 +1012,7 @@ cleanup_audio_decoder_thread:
     av_freep(&swr_output_buffer);
     av_parser_close(decode_parser);
     swr_free(&swr);
+    free(inbuf);
 
     return NULL;
 }
