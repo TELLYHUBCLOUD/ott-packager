@@ -2577,15 +2577,15 @@ void *video_decode_thread(void *context)
 
                 if (core->reinitialize_decoder) {
                     memset(decode_error,0,sizeof(decode_error));
+                    avcodec_close(decode_avctx);
+                    avcodec_free_context(&decode_avctx);
+                    av_parser_close(decode_parser);
                     av_frame_free(&decode_av_frame);
                     av_packet_free(&decode_pkt);
 #if defined(ENABLE_GPU_DECODE)
                     av_frame_free(&nvidia_surface);
                     av_buffer_unref(&nvidia_device_ctx);
 #endif
-                    avcodec_close(decode_avctx);
-                    av_parser_close(decode_parser);
-                    avcodec_free_context(&decode_avctx);
                     sws_freeContext(decode_converter);
                     av_freep(&output_data[0]);
                     core->reinitialize_decoder = 0;
@@ -3114,15 +3114,15 @@ cleanup_video_decoder_thread:
     free(wbuffer);
     core->reinitialize_decoder = 0;
     video_decoder_ready = 0;
+    avcodec_close(decode_avctx);
+    avcodec_free_context(&decode_avctx);
+    av_parser_close(decode_parser);
     av_frame_free(&decode_av_frame);
     av_packet_free(&decode_pkt);
 #if defined(ENABLE_GPU_DECODE)
     av_frame_free(&nvidia_surface);
     av_buffer_unref(&nvidia_device_ctx);
 #endif
-    avcodec_close(decode_avctx);
-    av_parser_close(decode_parser);
-    avcodec_free_context(&decode_avctx);
     sws_freeContext(decode_converter);
     av_freep(&output_data[0]);
 
