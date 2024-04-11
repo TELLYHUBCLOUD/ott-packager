@@ -619,7 +619,7 @@ void *video_encode_thread_nvenc(void *context)
             }
 
             nalsize = gpu_data[current_encoder].encode_pkt->size;
-            nal_buffer = (uint8_t*)memory_take(core->compressed_video_pool, nalsize);
+            nal_buffer = (uint8_t*)memory_take(core->compressed_video_pool, nalsize*2);
             if (!nal_buffer) {
                 fprintf(stderr,"FATAL ERROR: unable to obtain nal_buffer!!\n");
                 send_direct_error(core, SIGNAL_DIRECT_ERROR_NALPOOL, "Out of NAL Buffers (H264/H265) - Restarting Service");
@@ -998,7 +998,7 @@ void *video_encode_thread_x265(void *context)
                 }
 
                 nalout = x265_data[current_encoder].p_nal;
-                nal_buffer = (uint8_t*)memory_take(core->compressed_video_pool, nalsize);
+                nal_buffer = (uint8_t*)memory_take(core->compressed_video_pool, nalsize*2);
                 if (!nal_buffer) {
                     fprintf(stderr,"FATAL ERROR: unable to obtain nal_buffer!!\n");
                     send_direct_error(core, SIGNAL_DIRECT_ERROR_NALPOOL, "Out of NAL Buffers (H265) - Restarting Service");
@@ -1408,7 +1408,7 @@ void *video_encode_thread_x264(void *context)
                     clock_gettime(CLOCK_MONOTONIC, &core->video_encode_time);
                 }
 
-                nal_buffer = (uint8_t*)memory_take(core->compressed_video_pool, output_size);
+                nal_buffer = (uint8_t*)memory_take(core->compressed_video_pool, output_size*2);
                 if (!nal_buffer) {
                     fprintf(stderr,"FATAL ERROR: unable to obtain nal_buffer!!\n");
                     send_direct_error(core, SIGNAL_DIRECT_ERROR_NALPOOL, "Out of NAL Buffers (H264) - Restarting Service");
@@ -2290,7 +2290,7 @@ void *video_prepare_thread(void *context)
                         av_sync_offset = (((double)deinterlaced_frame_count - (double)sync_frame_count)/(double)fps)*(double)1000.0;
                         sync_diff = (int64_t)deinterlaced_frame_count - (int64_t)sync_frame_count;
 
-                        fprintf(stderr,"video_prepare_thread: deinterlaced_frame_count=%ld sync_frame_count=%ld sync_offset=%ld (%.2fms) pkt_pts=%ld pkt_dts=%ld ft=%ld fps=%.2f\n",
+                        fprintf(stderr,"video_prepare_thread: deinterlaced_frame_count=%ld sync_frame_count=%ld sync_diff=%ld (%.2fms) pkt_pts=%ld pkt_dts=%ld ft=%ld fps=%.2f\n",
                                 deinterlaced_frame_count,
                                 sync_frame_count,
                                 sync_diff,
@@ -2324,66 +2324,79 @@ void *video_prepare_thread(void *context)
                         }
 
                         if (sync_diff < -1) {
-                            send_signal(core, SIGNAL_FRAME_REPEAT, "Repeating Video Frame To Maintain A/V Sync");
+                            int max_repeat_count = (int)(((double)fps/(double)4)+0.5);
+                            int sync_diff_abs = abs(sync_diff);
+                            int r;
+                            if (max_repeat_count == 0) {
+                                max_repeat_count = 1;
+                            }
+                            if (sync_diff_abs > max_repeat_count) {
+                                sync_diff_abs = max_repeat_count;
+                            }
+                            for (r = 0; r < sync_diff_abs; r++) {
+                                char errormsg[MAX_MESSAGE_SIZE];
+                                snprintf(errormsg, MAX_MESSAGE_SIZE-1, "Repeating Video Frame To Maintain A/V Sync (%d/%d)",
+                                         r+1, sync_diff_abs);
+                                send_signal(core, SIGNAL_FRAME_REPEAT, errormsg);
+                                uint8_t *repeated_buffer = (uint8_t*)memory_take(core->raw_video_pool, video_frame_size);
+                                if (repeated_buffer) {
+                                    memcpy(repeated_buffer, deinterlaced_buffer, video_frame_size);
 
-                            uint8_t *repeated_buffer = (uint8_t*)memory_take(core->raw_video_pool, video_frame_size);
-                            if (repeated_buffer) {
-                                memcpy(repeated_buffer, deinterlaced_buffer, video_frame_size);
+                                    scale_msg = (dataqueue_message_struct*)memory_take(core->fillet_msg_pool, sizeof(dataqueue_message_struct));
+                                    if (!scale_msg) {
+                                        send_direct_error(core, SIGNAL_DIRECT_ERROR_MSGPOOL, "Out of Message Buffers (VIDEO) - Restarting Service");
+                                        _Exit(0);
+                                    }
+                                    scale_msg->buffer = repeated_buffer;
+                                    scale_msg->buffer_size = video_frame_size;
+                                    scale_msg->pts = 0;
+                                    scale_msg->dts = 0;
+                                    scale_msg->tff = 1;
+                                    scale_msg->interlaced = 0;
+                                    scale_msg->fps_num = msg->fps_num;
+                                    scale_msg->fps_den = msg->fps_den;
+                                    scale_msg->aspect_num = msg->aspect_num;
+                                    scale_msg->aspect_den = msg->aspect_den;
+                                    scale_msg->width = width;
+                                    scale_msg->height = height;
+                                    scale_msg->stream_index = -1;
+                                    scale_msg->caption_buffer = NULL;
+                                    scale_msg->caption_size = 0;
+                                    scale_msg->caption_timestamp = 0;
 
-                                scale_msg = (dataqueue_message_struct*)memory_take(core->fillet_msg_pool, sizeof(dataqueue_message_struct));
-                                if (!scale_msg) {
-                                    send_direct_error(core, SIGNAL_DIRECT_ERROR_MSGPOOL, "Out of Message Buffers (VIDEO) - Restarting Service");
+                                    if (opaque_data) {
+                                        scale_msg->splice_point = opaque_data->splice_point;
+                                        scale_msg->splice_duration = opaque_data->splice_duration;
+                                        scale_msg->splice_duration_remaining = opaque_data->splice_duration_remaining;
+                                    } else {
+                                        scale_msg->splice_point = 0;
+                                        scale_msg->splice_duration = 0;
+                                        scale_msg->splice_duration_remaining = 0;
+                                    }
+
+                                    deinterlaced_frame_count++;  // frames since the video start time
+                                    dataqueue_put_front(core->scalevideo->input_queue, scale_msg);
+                                } else {
+                                    char errormsg[MAX_MESSAGE_SIZE];
+                                    int n;
+                                    int smp = memory_unused(core->fillet_msg_pool);
+                                    int fmp = memory_unused(core->frame_msg_pool);
+                                    int cvp = memory_unused(core->compressed_video_pool);
+                                    int cap = memory_unused(core->compressed_audio_pool);
+                                    int s35p = memory_unused(core->scte35_pool);
+                                    int rvp = memory_unused(core->raw_video_pool);
+                                    int rap = memory_unused(core->raw_audio_pool);
+                                    int vdecfw = dataqueue_get_size(core->transvideo->input_queue);
+                                    int vdinfw = dataqueue_get_size(core->preparevideo->input_queue);
+                                    int vefw = 0;
+                                    for (n = 0; n < core->cd->num_outputs; n++) {
+                                        vefw += dataqueue_get_size(core->encodevideo->input_queue[n]);
+                                    }
+                                    snprintf(errormsg, MAX_MESSAGE_SIZE-1, "Out of Uncompressed Video Buffers (SYNC), Restarting Service, vefw=%d, vdinfw=%d, vdecfw=%d, rap=%d, rvp=%d, s35p=%d, cap=%d, cvp=%d, fmp=%d, smp=%d",
+                                             vefw, vdinfw, vdecfw, rap, rvp, s35p, cap, cvp, fmp, smp);
+                                    send_direct_error(core, SIGNAL_DIRECT_ERROR_RAWPOOL, errormsg);
                                     _Exit(0);
                                 }
-                                scale_msg->buffer = repeated_buffer;
-                                scale_msg->buffer_size = video_frame_size;
-                                scale_msg->pts = 0;
-                                scale_msg->dts = 0;
-                                scale_msg->tff = 1;
-                                scale_msg->interlaced = 0;
-                                scale_msg->fps_num = msg->fps_num;
-                                scale_msg->fps_den = msg->fps_den;
-                                scale_msg->aspect_num = msg->aspect_num;
-                                scale_msg->aspect_den = msg->aspect_den;
-                                scale_msg->width = width;
-                                scale_msg->height = height;
-                                scale_msg->stream_index = -1;
-                                scale_msg->caption_buffer = NULL;
-                                scale_msg->caption_size = 0;
-                                scale_msg->caption_timestamp = 0;
-
-                                if (opaque_data) {
-                                    scale_msg->splice_point = opaque_data->splice_point;
-                                    scale_msg->splice_duration = opaque_data->splice_duration;
-                                    scale_msg->splice_duration_remaining = opaque_data->splice_duration_remaining;
-                                } else {
-                                    scale_msg->splice_point = 0;
-                                    scale_msg->splice_duration = 0;
-                                    scale_msg->splice_duration_remaining = 0;
-                                }
-
-                                deinterlaced_frame_count++;  // frames since the video start time
-                                dataqueue_put_front(core->scalevideo->input_queue, scale_msg);
-                            } else {
-                                char errormsg[MAX_MESSAGE_SIZE];
-                                int n;
-                                int smp = memory_unused(core->fillet_msg_pool);
-                                int fmp = memory_unused(core->frame_msg_pool);
-                                int cvp = memory_unused(core->compressed_video_pool);
-                                int cap = memory_unused(core->compressed_audio_pool);
-                                int s35p = memory_unused(core->scte35_pool);
-                                int rvp = memory_unused(core->raw_video_pool);
-                                int rap = memory_unused(core->raw_audio_pool);
-                                int vdecfw = dataqueue_get_size(core->transvideo->input_queue);
-                                int vdinfw = dataqueue_get_size(core->preparevideo->input_queue);
-                                int vefw = 0;
-                                for (n = 0; n < core->cd->num_outputs; n++) {
-                                    vefw += dataqueue_get_size(core->encodevideo->input_queue[n]);
-                                }
-                                snprintf(errormsg, MAX_MESSAGE_SIZE-1, "Out of Uncompressed Video Buffers (SYNC), Restarting Service, vefw=%d, vdinfw=%d, vdecfw=%d, rap=%d, rvp=%d, s35p=%d, cap=%d, cvp=%d, fmp=%d, smp=%d",
-                                         vefw, vdinfw, vdecfw, rap, rvp, s35p, cap, cvp, fmp, smp);
-                                send_direct_error(core, SIGNAL_DIRECT_ERROR_RAWPOOL, errormsg);
-                                _Exit(0);
                             }
                         }
 
@@ -2504,7 +2517,7 @@ void *video_decode_thread(void *context)
 {
     fillet_app_struct *core = (fillet_app_struct*)context;
     int video_decoder_ready = 0;
-    dataqueue_message_struct *msg;
+    dataqueue_message_struct *msg = NULL;
     AVCodecParserContext *decode_parser = NULL;
     AVCodecContext *decode_avctx = NULL;
     const AVCodec *decode_codec = NULL;
@@ -2544,6 +2557,15 @@ void *video_decode_thread(void *context)
     memset(signal_data,0,sizeof(signal_data));
     memset(decode_error,0,sizeof(decode_error));
 
+    output_data[0] = NULL;
+    output_data[1] = NULL;
+    output_data[2] = NULL;
+    output_data[3] = NULL;
+    source_data[0] = NULL;
+    source_data[1] = NULL;
+    source_data[2] = NULL;
+    source_data[3] = NULL;
+
     fprintf(stderr,"status: starting video decode thread: %d\n", video_decode_thread_running);
 
     wbuffer = (uint8_t*)malloc(MAX_VIDEO_PES_BUFFER);
@@ -2575,19 +2597,39 @@ void *video_decode_thread(void *context)
                 int retcode;
                 char gpu_select_string[MAX_FILENAME_SIZE];
 
-                if (core->reinitialize_decoder) {
+                if (core->reinitialize_decoder && decode_avctx != NULL) {
+                    retcode = avcodec_send_packet(decode_avctx, NULL);
+                    while (retcode == 0) {
+                        retcode = avcodec_receive_frame(decode_avctx, decode_av_frame);
+                    }
                     memset(decode_error,0,sizeof(decode_error));
+                    fprintf(stderr,"video_decode_thread: closing decoder\n");
                     avcodec_close(decode_avctx);
+                    fprintf(stderr,"video_decode_thread: removing decoder context\n");
                     avcodec_free_context(&decode_avctx);
+                    fprintf(stderr,"video_decode_thread: closing parser\n");
                     av_parser_close(decode_parser);
+                    fprintf(stderr,"video_decode_thread: freeing decode_av_frame\n");
                     av_frame_free(&decode_av_frame);
+                    fprintf(stderr,"video_decode_thread: freeing decode_pkt\n");
                     av_packet_free(&decode_pkt);
 #if defined(ENABLE_GPU_DECODE)
                     av_frame_free(&nvidia_surface);
                     av_buffer_unref(&nvidia_device_ctx);
 #endif
-                    sws_freeContext(decode_converter);
-                    av_freep(&output_data[0]);
+                    if (decode_converter) {
+                        fprintf(stderr,"video_decode_thread: cleaning decode_converter\n");
+                        sws_freeContext(decode_converter);
+                        decode_converter = NULL;
+                    }
+                    if (output_data[0]) {
+                        fprintf(stderr,"video_decode_thread: cleaning up output_data\n");
+                        av_freep(&output_data[0]);
+                        output_data[0] = NULL;
+                        output_data[1] = NULL;
+                        output_data[2] = NULL;
+                        output_data[3] = NULL;
+                    }
                     core->reinitialize_decoder = 0;
                     video_decoder_ready = 0;
                     output_frames = 0;
@@ -2645,6 +2687,9 @@ void *video_decode_thread(void *context)
                 uint8_t *incoming_video_buffer = frame->buffer;
                 int incoming_video_buffer_size = frame->buffer_size;
 
+                if (incoming_video_buffer_size > MAX_VIDEO_PES_BUFFER) {
+                    incoming_video_buffer_size = MAX_VIDEO_PES_BUFFER;
+                }
                 memcpy(wbuffer, incoming_video_buffer, incoming_video_buffer_size);
                 uint8_t *working_incoming_video_buffer = wbuffer;
                 int working_incoming_video_buffer_size = incoming_video_buffer_size;
@@ -3114,17 +3159,29 @@ cleanup_video_decoder_thread:
     free(wbuffer);
     core->reinitialize_decoder = 0;
     video_decoder_ready = 0;
-    avcodec_close(decode_avctx);
-    avcodec_free_context(&decode_avctx);
-    av_parser_close(decode_parser);
-    av_frame_free(&decode_av_frame);
-    av_packet_free(&decode_pkt);
+    if (decode_avctx) {
+        avcodec_close(decode_avctx);
+        avcodec_free_context(&decode_avctx);
+    }
+    if (decode_parser) {
+        av_parser_close(decode_parser);
+    }
+    if (decode_av_frame) {
+        av_frame_free(&decode_av_frame);
+    }
+    if (decode_pkt) {
+        av_packet_free(&decode_pkt);
+    }
 #if defined(ENABLE_GPU_DECODE)
     av_frame_free(&nvidia_surface);
     av_buffer_unref(&nvidia_device_ctx);
 #endif
-    sws_freeContext(decode_converter);
-    av_freep(&output_data[0]);
+    if (decode_converter) {
+        sws_freeContext(decode_converter);
+    }
+    if (output_data[0]) {
+        av_freep(&output_data[0]);
+    }
 
     return NULL;
 }
